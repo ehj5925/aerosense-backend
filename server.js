@@ -63,60 +63,70 @@ for (let r = 0; r < ROWS; r++) {
 }
 
 // ---------- 기상청 호출 헬퍼 ----------
-async function kmaGetJson(path, params) {
+async function kmaGetRaw(path, params) {
   const url = new URL(KMA_BASE + path);
   Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
   url.searchParams.set("authKey", KMA_AUTH_KEY);
   const res = await fetch(url.toString());
-  const text = await res.text();
-  try { return JSON.parse(text); }
-  catch (e) {
-    // typ02 계열은 dataType=JSON을 줘도 실패 시 XML/에러 텍스트를 줄 수 있어 그대로 반환
-    return { __raw: text, __parseError: true };
-  }
+  return await res.text();
+}
+// 실제로는 typ02 계열도 IWXXM 관측/특보는 dataType=JSON을 줘도 XML(IWXXM 표준 포맷)을
+// 그대로 돌려주는 경우가 확인되어, JSON을 먼저 시도하고 실패하면 정규식으로 필요한 값만 뽑아낸다.
+function extractTag(xml, tag) {
+  const re = new RegExp(`<${tag}[^>]*>([^<]*)<\\/${tag}>`, "i");
+  const m = xml.match(re);
+  return m ? m[1].trim() : null;
+}
+function hasPresentWeather(xml) {
+  return /<iwxxm:presentWeather[^>]*>[^<]+<\/iwxxm:presentWeather>/.test(xml);
 }
 
 // ---------- 1) 공항 METAR (실황: 풍속/시정/강수/구름) ----------
+async function fetchMetarOne(a) {
+  const xml = await kmaGetRaw("/api/typ02/openApi/AmmIwxxmService/getMetar", {
+    pageNo: 1, numOfRows: 1, dataType: "JSON", icao: a.icao,
+  });
+  const windKt = parseFloat(extractTag(xml, "iwxxm:meanWindSpeed"));
+  const gustKt = parseFloat(extractTag(xml, "iwxxm:windGustSpeed"));
+  const visM = parseFloat(extractTag(xml, "iwxxm:prevailingVisibility"));
+  return {
+    windKt: isNaN(windKt) ? null : windKt,
+    gustKt: isNaN(gustKt) ? null : gustKt,
+    visM: isNaN(visM) ? null : visM,
+    precip: hasPresentWeather(xml) ? 0.6 : 0,
+  };
+}
 async function fetchMetarAll() {
   const results = {};
   await Promise.all(AIRPORTS.map(async (a) => {
-    try {
-      const data = await kmaGetJson("/api/typ02/openApi/AmmIwxxmService/getMetar", {
-        pageNo: 1, numOfRows: 1, dataType: "JSON", icao: a.icao,
-      });
-      const item = data?.response?.body?.items?.item?.[0] || data?.items?.[0] || data;
-      results[a.id] = {
-        windKt: parseFloat(item?.["iwxxm:meanWindSpeed"]) || null,
-        gustKt: parseFloat(item?.["iwxxm:windGustSpeed"]) || null,
-        visM: parseFloat(item?.["iwxxm:AerodromeHorizontalVisibility"]) || null,
-        clouds: item?.["iwxxm:AerodromeObservedClouds"] || null,
-        presentWeather: item?.["iwxxm:presentWeather"] || null,
-        obsTime: item?.["om:phenomenonTime"] || null,
-      };
-    } catch (e) {
-      results[a.id] = null; // 이 공항만 실패 — 나머지는 계속 진행
-    }
+    try { results[a.id] = await fetchMetarOne(a); }
+    catch (e) { results[a.id] = null; } // 이 공항만 실패 — 나머지는 계속 진행
   }));
   return results;
 }
 
 // ---------- 2) SIGMET / AIRMET (공식 위험기상 특보 — 난기류 근사 신호) ----------
+function extractItemBlocks(xml) {
+  const items = [];
+  const itemRe = /<item>([\s\S]*?)<\/item>/g;
+  let m;
+  while ((m = itemRe.exec(xml))) items.push(m[1]);
+  return items;
+}
 async function fetchHazards() {
   const out = { turbulenceActive: false, messages: [] };
   try {
-    const [sig, air] = await Promise.all([
-      kmaGetJson("/api/typ02/openApi/AmmService/getSigmet", { pageNo: 1, numOfRows: 20, dataType: "JSON" }),
-      kmaGetJson("/api/typ02/openApi/AmmService/getAirmet", { pageNo: 1, numOfRows: 20, dataType: "JSON" }),
+    const [sigXml, airXml] = await Promise.all([
+      kmaGetRaw("/api/typ02/openApi/AmmService/getSigmet", { pageNo: 1, numOfRows: 20, dataType: "JSON" }),
+      kmaGetRaw("/api/typ02/openApi/AmmService/getAirmet", { pageNo: 1, numOfRows: 20, dataType: "JSON" }),
     ]);
-    const items = [
-      ...(sig?.response?.body?.items?.item || []),
-      ...(air?.response?.body?.items?.item || []),
-    ];
-    items.forEach((it) => {
-      const msg = it.sigmetMsg || it.airmetMsg || "";
-      out.messages.push({ icaoCode: it.icaoCode, msg, stTm: it.stTm, edTm: it.edTm });
+    for (const raw of [...extractItemBlocks(sigXml), ...extractItemBlocks(airXml)]) {
+      const msg = extractTag(raw, "sigmetMsg") || extractTag(raw, "airmetMsg") || "";
+      const icaoCode = extractTag(raw, "icaoCode");
+      const stTm = extractTag(raw, "stTm"), edTm = extractTag(raw, "edTm");
+      out.messages.push({ icaoCode, msg, stTm, edTm });
       if (/TURB|CB|TS|OBSC/i.test(msg)) out.turbulenceActive = true;
-    });
+    }
   } catch (e) {
     // 특보 조회 실패해도 전체 흐름은 계속 (난기류는 보수적으로 낮게 처리)
   }
@@ -245,3 +255,4 @@ app.listen(PORT, () => {
   console.log(`AeroSense backend listening on http://localhost:${PORT}`);
   console.log(`KMA_AUTH_KEY set: ${!!KMA_AUTH_KEY}`);
 });
+
